@@ -27,7 +27,7 @@
 - **🔄 Multi-Query Generation**: Generates multiple variations to improve retrieval quality
 - **✨ Answer Evaluation**: AI-powered quality assessment with automatic retry on poor answers
 - **👥 Enterprise RBAC**: Role-based access control with Admin, User, and Viewer roles
-- **📁 Multi-Modal Support**: Text, images (OCR), and audio (speech-to-text) processingQuery - Offline Multimodal RAG SystemSure! Here’s a **professional, concise, and clear README description** for your **Offline Multimodal RAG System** project. I’ve written it in a way that’s suitable for GitHub or portfolio showcase:
+- **📁 Multi-Modal Support**: Text, images (OCR), and audio (speech-to-text) processingQuery - Offline Multimodal RAG System
 
 
 
@@ -470,7 +470,6 @@ AI: [Contextual follow-up answer]
 # PostgreSQL Database
 DATABASE_URL=postgresql+asyncpg://username@localhost/supaquery
 
-# JWT Authentication
 SECRET_KEY=your-secret-key-here-use-openssl-rand-hex-32
 ACCESS_TOKEN_EXPIRE_MINUTES=30
 

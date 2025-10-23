@@ -79,25 +79,69 @@ STORAGE_DIR.mkdir(exist_ok=True)
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database on startup"""
+    """Initialize database and rebuild indexes on startup"""
     print("🚀 Starting SupaQuery Backend with PostgreSQL + RBAC...")
     try:
+        # Step 1: Initialize database
         await db_service.init_db()
         print(f"   ✓ Database initialized")
         
-        # Get document count from database
+        # Step 2: Rebuild FAISS index from PostgreSQL (industry standard approach)
+        print(f"\n🔄 Rebuilding FAISS index from database...")
         try:
-            docs = await db_service.list_documents(limit=1)
-            # Get stats from graph
-            stats = graph_rag_service.graph.get_stats()
-            print(f"   - Documents indexed: {stats['documents']} (graph), {len(docs)} (db sample)")
-        except Exception as count_error:
-            print(f"   - Documents indexed: Unable to retrieve ({count_error})")
+            # Clear existing FAISS index
+            graph_rag_service.hybrid_rag.faiss.clear_index()
+            
+            # Rebuild from PostgreSQL documents
+            docs = await db_service.list_documents(limit=10000)
+            total_chunks_added = 0
+            
+            for doc in docs:
+                chunks = await db_service.get_document_chunks(doc.id)
+                if chunks:
+                    faiss_chunks = []
+                    for chunk in chunks:
+                        # Convert filename to file_id (remove extension)
+                        file_id = doc.filename.rsplit('.', 1)[0]
+                        faiss_chunks.append({
+                            'doc_id': file_id,
+                            'text': chunk.text,
+                            'source': doc.original_filename,
+                            'chunk_id': str(chunk.id),
+                            'metadata': chunk.chunk_metadata or {}
+                        })
+                    
+                    if faiss_chunks:
+                        graph_rag_service.hybrid_rag.faiss.add_chunks(faiss_chunks)
+                        total_chunks_added += len(faiss_chunks)
+            
+            print(f"   ✓ Rebuilt FAISS index: {total_chunks_added} chunks from {len(docs)} documents")
+        except Exception as index_error:
+            print(f"   ⚠️  Failed to rebuild FAISS index: {index_error}")
+            print(f"   - System will continue but search may not work correctly")
         
-        print(f"   - Authentication: Enabled (JWT)")
-        print(f"   - RBAC: Enabled")
+        # Step 3: Get final stats
+        try:
+            stats = graph_rag_service.graph.get_stats()
+            faiss_count = len(graph_rag_service.hybrid_rag.faiss.chunk_metadata)
+            print(f"\n📊 System Status:")
+            print(f"   - PostgreSQL: {len(docs)} documents")
+            print(f"   - Memgraph: {stats['documents']} documents, {stats['chunks']} chunks")
+            print(f"   - FAISS: {faiss_count} chunks")
+            
+            # Warn if systems are out of sync
+            if len(docs) != stats['documents']:
+                print(f"   ⚠️  WARNING: Database ({len(docs)}) and Memgraph ({stats['documents']}) out of sync!")
+                print(f"   - Run POST /api/admin/cleanup to sync systems")
+        except Exception as stats_error:
+            print(f"   - Unable to retrieve stats: {stats_error}")
+        
+        print(f"\n   ✓ Authentication: Enabled (JWT)")
+        print(f"   ✓ RBAC: Enabled")
+        print(f"   ✓ Ready to serve requests\n")
+        
     except Exception as e:
-        print(f"   ✗ Database initialization error: {e}")
+        print(f"   ✗ Startup error: {e}")
         print(f"   - Please ensure PostgreSQL is running and DATABASE_URL is correct")
         print(f"   - Run 'python init_db.py' to set up the database")
 
@@ -513,37 +557,114 @@ async def delete_document(
     current_user: User = Depends(require_documents_delete)
 ):
     """
-    Delete a document from the system
+    Delete a document from the system with atomic cleanup
     Only the owner can delete
     Requires 'documents:delete' permission
+    
+    Cleanup steps:
+    1. Delete from PostgreSQL (source of truth)
+    2. Delete from Memgraph (knowledge graph)
+    3. Delete from FAISS (semantic index)
+    4. Delete physical file
+    5. Save FAISS index to disk
     """
+    print(f"\n🗑️ Deleting document {document_id}...")
+    
+    # Track what was deleted for rollback if needed
+    deleted_from_db = False
+    deleted_from_memgraph = False
+    deleted_from_faiss = False
+    deleted_file = False
+    
     try:
         # Check document ownership
         await check_document_access(current_user, document_id, action='delete')
         
-        # Get document info before deletion (to retrieve file path)
+        # Get document info before deletion
         document = await db_service.get_document(document_id, current_user.id)
         if not document:
             raise HTTPException(status_code=404, detail="Document not found or access denied")
         
         file_path = document.file_path
+        file_id = document.filename.rsplit('.', 1)[0]  # Convert to file_id for graph/FAISS
         
-        # Delete from database (cascades to chunks)
+        print(f"   📄 Document: {document.original_filename} (ID: {document_id}, FileID: {file_id})")
+        
+        # STEP 1: Delete from PostgreSQL (source of truth)
+        print(f"   1️⃣ Deleting from PostgreSQL...")
         success = await db_service.delete_document(document_id, current_user.id)
-        
         if not success:
-            raise HTTPException(status_code=404, detail="Document not found or access denied")
+            raise HTTPException(status_code=404, detail="Failed to delete from database")
+        deleted_from_db = True
+        print(f"      ✓ Deleted from PostgreSQL")
         
-        # Remove from GraphRAG and delete physical file
-        await graph_rag_service.delete_document(str(document_id), file_path=file_path)
+        # STEP 2: Delete from Memgraph
+        print(f"   2️⃣ Deleting from Memgraph knowledge graph...")
+        try:
+            mg_success = graph_rag_service.graph.delete_document(file_id)
+            deleted_from_memgraph = mg_success
+            if mg_success:
+                print(f"      ✓ Deleted from Memgraph")
+            else:
+                print(f"      ⚠️  Not found in Memgraph (may have been already deleted)")
+        except Exception as mg_error:
+            print(f"      ⚠️  Memgraph deletion failed: {mg_error}")
+        
+        # STEP 3: Delete from FAISS index
+        print(f"   3️⃣ Deleting from FAISS semantic index...")
+        try:
+            faiss_success = graph_rag_service.hybrid_rag.faiss.delete_document(file_id)
+            deleted_from_faiss = faiss_success
+            if faiss_success:
+                print(f"      ✓ Deleted from FAISS and saved index")
+            else:
+                print(f"      ⚠️  Not found in FAISS (may have been already deleted)")
+        except Exception as faiss_error:
+            print(f"      ⚠️  FAISS deletion failed: {faiss_error}")
+        
+        # STEP 4: Delete physical file
+        print(f"   4️⃣ Deleting physical file...")
+        if file_path:
+            try:
+                from pathlib import Path
+                file = Path(file_path)
+                if file.exists():
+                    file.unlink()
+                    deleted_file = True
+                    print(f"      ✓ Deleted physical file: {file_path}")
+                else:
+                    print(f"      ⚠️  File not found (may have been already deleted): {file_path}")
+            except Exception as file_error:
+                print(f"      ⚠️  File deletion failed: {file_error}")
+        else:
+            print(f"      ⚠️  No file path recorded")
+        
+        # Summary
+        print(f"\n   ✅ Document deletion completed:")
+        print(f"      - PostgreSQL: {'✓' if deleted_from_db else '✗'}")
+        print(f"      - Memgraph: {'✓' if deleted_from_memgraph else '⚠️'}")
+        print(f"      - FAISS: {'✓' if deleted_from_faiss else '⚠️'}")
+        print(f"      - Physical file: {'✓' if deleted_file else '⚠️'}")
         
         return {
             "success": True,
-            "message": f"Document {document_id} deleted successfully"
+            "message": f"Document {document_id} deleted successfully",
+            "cleanup_status": {
+                "database": deleted_from_db,
+                "memgraph": deleted_from_memgraph,
+                "faiss": deleted_from_faiss,
+                "file": deleted_file
+            }
         }
+        
     except HTTPException:
         raise
     except Exception as e:
+        print(f"\n   ❌ Deletion error: {e}")
+        # Log what was partially deleted
+        if deleted_from_db or deleted_from_memgraph or deleted_from_faiss or deleted_file:
+            print(f"   ⚠️  WARNING: Partial deletion occurred (systems may be out of sync)")
+            print(f"   - Run POST /api/admin/cleanup to resync systems")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -683,21 +804,45 @@ async def chat(
         
         # Build response carefully, ensuring all fields are properly formatted
         try:
+            print(f"   🔧 Creating ChatResponse object...")
+            
+            # Debug: Check each field before creating response
+            answer = str(response.get("answer", ""))
+            citations = response.get("citations", [])
+            sources = response.get("sources", [])
+            evaluation = response.get("evaluation")
+            strategy = response.get("strategy")
+            
+            print(f"   📊 Response fields:")
+            print(f"      - Answer: {len(answer)} chars")
+            print(f"      - Citations: {len(citations)} items")
+            print(f"      - Sources: {len(sources)} items")
+            print(f"      - Evaluation: {type(evaluation)}")
+            print(f"      - Strategy: {strategy}")
+            
+            # Create response object
             chat_response = ChatResponse(
                 success=True,
-                response=str(response.get("answer", "")),
-                citations=response.get("citations", []),
-                sources=response.get("sources", []),
+                response=answer,
+                citations=citations,
+                sources=sources,
                 timestamp=datetime.now().isoformat(),
-                evaluation=response.get("evaluation"),
-                strategy=response.get("strategy")
+                evaluation=evaluation,
+                strategy=strategy
             )
             
-            print(f"   ✓ Chat response created successfully")
+            print(f"   ✓ Chat response object created successfully")
+            print(f"   📤 Returning response...")
             return chat_response
+            
         except Exception as validation_error:
             print(f"   ❌ Response validation error: {validation_error}")
-            print(f"   Response data: {response}")
+            print(f"   Response data keys: {list(response.keys())}")
+            # Print first few items of problematic arrays
+            if "citations" in response:
+                print(f"   Citations preview: {response['citations'][:2] if response['citations'] else 'empty'}")
+            if "sources" in response:
+                print(f"   Sources preview: {response['sources'][:2] if response['sources'] else 'empty'}")
             raise
         
     except HTTPException:
@@ -895,6 +1040,162 @@ async def assign_role(
         }
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== ADMIN/DEBUG ENDPOINTS ====================
+
+@app.post("/api/admin/cleanup")
+async def admin_cleanup_system(
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Admin endpoint to force cleanup and sync of all systems
+    Clears stale data from Memgraph, FAISS, and syncs with PostgreSQL
+    """
+    # Only allow superusers to run cleanup
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only superusers can run system cleanup"
+        )
+    
+    try:
+        cleanup_results = {
+            "database_documents": 0,
+            "memgraph_documents": 0,
+            "memgraph_chunks": 0,
+            "faiss_chunks": 0,
+            "orphaned_cleared": False,
+            "indexes_rebuilt": False
+        }
+        
+        # Step 1: Get actual document list from PostgreSQL
+        print("\n🔍 Step 1: Scanning PostgreSQL database...")
+        db_documents = await db_service.list_documents(limit=1000)
+        db_doc_ids = set([str(doc.id) for doc in db_documents])
+        cleanup_results["database_documents"] = len(db_doc_ids)
+        print(f"   ✓ Found {len(db_doc_ids)} documents in PostgreSQL")
+        
+        # Step 2: Get documents in Memgraph
+        print("\n🔍 Step 2: Scanning Memgraph...")
+        memgraph_stats = graph_rag_service.graph.get_stats()
+        cleanup_results["memgraph_documents"] = memgraph_stats['documents']
+        cleanup_results["memgraph_chunks"] = memgraph_stats['chunks']
+        print(f"   ✓ Memgraph has {memgraph_stats['documents']} documents, {memgraph_stats['chunks']} chunks")
+        
+        # Step 3: Get FAISS index count
+        print("\n🔍 Step 3: Scanning FAISS index...")
+        faiss_count = len(graph_rag_service.hybrid_rag.faiss.chunk_metadata)
+        cleanup_results["faiss_chunks"] = faiss_count
+        print(f"   ✓ FAISS index has {faiss_count} chunks")
+        
+        # Step 4: Delete orphaned documents from Memgraph (not in PostgreSQL)
+        print("\n🧹 Step 4: Cleaning orphaned Memgraph data...")
+        memgraph_docs = graph_rag_service.graph.list_documents(limit=1000)
+        orphan_count = 0
+        for mg_doc in memgraph_docs:
+            # Convert filename to doc_id (remove extension)
+            doc_id = mg_doc['id']
+            if doc_id not in db_doc_ids:
+                print(f"   🗑️ Deleting orphaned document from Memgraph: {doc_id} ({mg_doc.get('filename', 'unknown')})")
+                graph_rag_service.graph.delete_document(doc_id)
+                orphan_count += 1
+        
+        cleanup_results["orphaned_cleared"] = orphan_count > 0
+        print(f"   ✓ Cleared {orphan_count} orphaned documents from Memgraph")
+        
+        # Step 5: Rebuild FAISS index from PostgreSQL
+        print("\n🔄 Step 5: Rebuilding FAISS index from PostgreSQL...")
+        graph_rag_service.hybrid_rag.faiss.clear_index()
+        
+        rebuilt_chunks = 0
+        for doc in db_documents:
+            chunks = await db_service.get_document_chunks(doc.id)
+            if chunks:
+                faiss_chunks = []
+                for chunk in chunks:
+                    # Convert filename to file_id (remove extension)
+                    file_id = doc.filename.rsplit('.', 1)[0]
+                    faiss_chunks.append({
+                        'doc_id': file_id,
+                        'text': chunk.text,
+                        'source': doc.original_filename,
+                        'chunk_id': str(chunk.id),
+                        'metadata': chunk.chunk_metadata or {}
+                    })
+                
+                if faiss_chunks:
+                    graph_rag_service.hybrid_rag.faiss.add_chunks(faiss_chunks)
+                    rebuilt_chunks += len(faiss_chunks)
+        
+        cleanup_results["indexes_rebuilt"] = True
+        print(f"   ✓ Rebuilt FAISS index with {rebuilt_chunks} chunks from {len(db_documents)} documents")
+        
+        # Step 6: Get final stats
+        print("\n📊 Final system state:")
+        final_stats = graph_rag_service.graph.get_stats()
+        final_faiss_count = len(graph_rag_service.hybrid_rag.faiss.chunk_metadata)
+        print(f"   PostgreSQL: {len(db_documents)} documents")
+        print(f"   Memgraph: {final_stats['documents']} documents, {final_stats['chunks']} chunks")
+        print(f"   FAISS: {final_faiss_count} chunks")
+        print(f"\n✅ System cleanup completed successfully!")
+        
+        return {
+            "success": True,
+            "message": "System cleanup completed",
+            "results": cleanup_results,
+            "final_state": {
+                "postgresql_documents": len(db_documents),
+                "memgraph_documents": final_stats['documents'],
+                "memgraph_chunks": final_stats['chunks'],
+                "faiss_chunks": final_faiss_count
+            }
+        }
+        
+    except Exception as e:
+        print(f"❌ Cleanup error: {e}")
+        raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
+
+
+@app.get("/api/admin/system-stats")
+async def admin_system_stats(
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get comprehensive system statistics across all subsystems
+    """
+    try:
+        # PostgreSQL stats
+        db_documents = await db_service.list_documents(limit=1000)
+        total_chunks = 0
+        for doc in db_documents:
+            chunks = await db_service.get_document_chunks(doc.id)
+            total_chunks += len(chunks)
+        
+        # Memgraph stats
+        memgraph_stats = graph_rag_service.graph.get_stats()
+        
+        # FAISS stats
+        faiss_count = len(graph_rag_service.hybrid_rag.faiss.chunk_metadata)
+        
+        return {
+            "postgresql": {
+                "documents": len(db_documents),
+                "chunks": total_chunks
+            },
+            "memgraph": memgraph_stats,
+            "faiss": {
+                "chunks": faiss_count,
+                "embedding_dimension": graph_rag_service.hybrid_rag.faiss.embedding_dim
+            },
+            "synced": (
+                len(db_documents) == memgraph_stats['documents'] and
+                total_chunks == faiss_count
+            )
+        }
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

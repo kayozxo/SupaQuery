@@ -53,7 +53,7 @@ SupaQuery is an intelligent document analysis platform that lets you upload vari
 ### 📄 Document Processing
 - **PDF Support**: Full text extraction with page number tracking
 - **DOCX Support**: Microsoft Word document processing
-- **Image OCR**: Extract text from images using Tesseract
+- **Image Processing**: Hybrid approach with Tesseract OCR (text) + CLIP (visual embeddings)
 - **Audio Transcription**: Speech-to-text with Whisper (tiny model)
 - **Smart Chunking**: 512-character chunks with 50-character overlap for context
 
@@ -126,7 +126,7 @@ chmod +x setup.sh
 
 * **LLM Models:** LLaMA 7B (4-bit quantized), MPT-7B, Dia / OpenLLaMA 3B
 
-**Embeddings:** `all-MiniLM-L6-v2` (text), CLIP ViT-B/32 (image)
+**Embeddings:** `all-MiniLM-L6-v2` (text), CLIP ViT-B-32 (image - hybrid with Tesseract)
 
 # Clone the repository* **Speech-to-Text:** Whisper Tiny (audio)
 
@@ -381,7 +381,8 @@ choco install ffmpeg
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
 | LLM | Ollama (llama3.2) | Answer generation |
-| Embeddings | HuggingFace Transformers | Sentence embeddings |
+| Text Embeddings | all-MiniLM-L6-v2 | Sentence embeddings (384-dim) |
+| Image Embeddings | CLIP ViT-B-32 | Visual embeddings (512-dim) |
 | NER | spaCy (en_core_web_sm) | Entity extraction |
 | OCR | Tesseract | Image text extraction |
 | Speech-to-Text | OpenAI Whisper (tiny) | Audio transcription |
@@ -1192,6 +1193,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES=15
 ### Comprehensive Guides
 
 - **[QUICK_START_ENHANCED.md](QUICK_START_ENHANCED.md)** - 5-minute getting started guide
+- **[HYBRID_IMAGE_PROCESSING.md](HYBRID_IMAGE_PROCESSING.md)** - Tesseract + CLIP hybrid approach
 - **[ENHANCED_ARCHITECTURE.md](ENHANCED_ARCHITECTURE.md)** - Detailed architecture documentation
 - **[VISUAL_ARCHITECTURE_GUIDE.md](VISUAL_ARCHITECTURE_GUIDE.md)** - Visual diagrams and workflows
 - **[TESTING_ENHANCED_FEATURES.md](TESTING_ENHANCED_FEATURES.md)** - Testing guide
@@ -1311,8 +1313,10 @@ A: Citations are extracted directly from document metadata and are highly accura
 - ✅ Audio timestamp citations
 - ✅ Knowledge graph with Memgraph
 - ✅ RBAC with JWT auth
+- ✅ Hybrid image processing (Tesseract + CLIP)
 
 ### v2.1 (Planned)
+- [ ] Visual image search (similarity-based)
 - [ ] Advanced graph visualizations
 - [ ] Document comparison features
 - [ ] Batch document upload

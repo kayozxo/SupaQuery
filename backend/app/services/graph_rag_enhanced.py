@@ -207,6 +207,7 @@ class EnhancedGraphRAGService:
     ) -> Dict[str, Any]:
         """
         Retrieve information using multiple query variations and merge results.
+        Now runs ALL queries through the full hybrid pipeline (FAISS + Memgraph + BM25).
         """
         
         print(f"🔎 Retrieving with {len(queries)} queries using HYBRID SYSTEM...")
@@ -214,72 +215,62 @@ class EnhancedGraphRAGService:
         all_chunks = []
         seen_chunk_ids = set()
         
-        # Use the hybrid retrieval system (FAISS + Memgraph + BM25) for the primary query
-        # This replaces the old Memgraph-only retrieval
-        primary_query = queries[0]
-        print(f"\n🔍 Combined Hybrid Retrieval Pipeline (Primary Query):")
-        
-        # STAGE 1: FAISS semantic retrieval (top 20 candidates)
-        print(f"   📊 Stage 1: FAISS semantic search...")
-        faiss_chunks = []
-        try:
-            faiss_chunks = self.hybrid_rag.faiss.search(primary_query, top_k=20, doc_ids=document_ids)
-            print(f"   ✓ FAISS retrieved {len(faiss_chunks)} chunks")
-        except Exception as e:
-            print(f"   ⚠️ FAISS error: {e}")
-        
-        # STAGE 2: Memgraph relational retrieval (related nodes/chunks)
-        print(f"   🕸️ Stage 2: Memgraph graph traversal...")
-        memgraph_chunks = []
-        try:
-            memgraph_chunks = self.hybrid_rag._retrieve_with_graph_traversal(
-                query=primary_query,
-                doc_ids=document_ids,
-                max_depth=2,
-                max_nodes=15
-            )
-            print(f"   ✓ Memgraph retrieved {len(memgraph_chunks)} chunks")
-        except Exception as e:
-            print(f"   ⚠️ Memgraph error: {e}")
-        
-        # STAGE 3: Merge and deduplicate
-        print(f"   🔀 Stage 3: Merging and deduplicating...")
-        merged_chunks = self.hybrid_rag._merge_and_deduplicate(faiss_chunks, memgraph_chunks)
-        print(f"   ✓ Merged to {len(merged_chunks)} unique chunks")
-        
-        # STAGE 3.5: SMART DOCUMENT FILTERING
-        # Extract named entities from query and match to document filenames
-        # This ensures queries about specific people/documents return relevant chunks
-        filtered_chunks = self._apply_smart_document_filter(primary_query, merged_chunks)
-        if filtered_chunks and len(filtered_chunks) < len(merged_chunks):
-            print(f"   🎯 Smart Filter: Filtered to {len(filtered_chunks)} relevant chunks based on query entities")
-            merged_chunks = filtered_chunks
-        
-        # STAGE 4: BM25 reranking on (filtered) merged results
-        if merged_chunks:
-            print(f"   🎯 Stage 4: BM25 reranking...")
-            all_chunks = self.hybrid_rag.faiss.rerank(primary_query, merged_chunks, top_k=top_k * 2)
-            print(f"   ✓ Reranked to top {len(all_chunks)} chunks")
-        else:
-            all_chunks = []
-        
-        # Optionally retrieve additional chunks for other query variations using Memgraph
-        if len(queries) > 1 and len(all_chunks) < top_k * 2:
-            print(f"   📝 Retrieving additional chunks from query variations...")
-            for i, q in enumerate(queries[1:], start=2):
-                if len(all_chunks) >= top_k * 2:
-                    break
-                print(f"      Query {i}: {q[:60]}...")
-                chunks = self.graph.query_similar_chunks(q, doc_ids=document_ids, limit=top_k)
+        # Run ALL queries through the complete hybrid pipeline
+        for query_idx, query in enumerate(queries, start=1):
+            print(f"\n🔍 Query {query_idx}/{len(queries)}: {query[:80]}...")
+            
+            # STAGE 1: FAISS semantic retrieval (top 20 candidates per query)
+            print(f"   📊 Stage 1: FAISS semantic search...")
+            faiss_chunks = []
+            try:
+                faiss_chunks = self.hybrid_rag.faiss.search(query, top_k=20, doc_ids=document_ids)
+                print(f"   ✓ FAISS retrieved {len(faiss_chunks)} chunks")
+            except Exception as e:
+                print(f"   ⚠️ FAISS error: {e}")
+            
+            # STAGE 2: Memgraph relational retrieval (related nodes/chunks)
+            print(f"   🕸️ Stage 2: Memgraph graph traversal...")
+            memgraph_chunks = []
+            try:
+                memgraph_chunks = self.hybrid_rag._retrieve_with_graph_traversal(
+                    query=query,
+                    doc_ids=document_ids,
+                    max_depth=2,
+                    max_nodes=15
+                )
+                print(f"   ✓ Memgraph retrieved {len(memgraph_chunks)} chunks")
+            except Exception as e:
+                print(f"   ⚠️ Memgraph error: {e}")
+            
+            # STAGE 3: Merge and deduplicate (within this query)
+            print(f"   🔀 Stage 3: Merging and deduplicating...")
+            merged_chunks = self.hybrid_rag._merge_and_deduplicate(faiss_chunks, memgraph_chunks)
+            print(f"   ✓ Merged to {len(merged_chunks)} unique chunks")
+            
+            # STAGE 3.5: SMART DOCUMENT FILTERING
+            # Extract named entities from query and match to document filenames
+            # This ensures queries about specific people/documents return relevant chunks
+            filtered_chunks = self._apply_smart_document_filter(query, merged_chunks)
+            if filtered_chunks and len(filtered_chunks) < len(merged_chunks):
+                print(f"   🎯 Smart Filter: Filtered to {len(filtered_chunks)} relevant chunks based on query entities")
+                merged_chunks = filtered_chunks
+            
+            # STAGE 4: BM25 reranking on (filtered) merged results
+            if merged_chunks:
+                print(f"   🎯 Stage 4: BM25 reranking...")
+                reranked_chunks = self.hybrid_rag.faiss.rerank(query, merged_chunks, top_k=top_k * 2)
+                print(f"   ✓ Reranked to top {len(reranked_chunks)} chunks")
                 
-                # Deduplicate
-                for chunk in chunks:
+                # Add to all_chunks with deduplication
+                for chunk in reranked_chunks:
                     chunk_id = chunk.get('id', chunk.get('text', '')[:50])
                     if chunk_id not in seen_chunk_ids:
                         seen_chunk_ids.add(chunk_id)
                         all_chunks.append(chunk)
+                        
+            print(f"   ✅ Query {query_idx} complete: {len(all_chunks)} total unique chunks so far")
         
-        print(f"   ✅ Total retrieved: {len(all_chunks)} unique chunks")
+        print(f"\n✅ Total retrieved: {len(all_chunks)} unique chunks from {len(queries)} queries")
         
         if not all_chunks:
             return {
@@ -292,8 +283,10 @@ class EnhancedGraphRAGService:
                 "strategy": "retrieve"
             }
         
-        # Limit chunks to prevent context overflow
-        all_chunks = all_chunks[:top_k * 2]  # Keep top 2*top_k chunks
+        # FINAL STAGE: Re-rank all chunks using the original query for consistency
+        print(f"   🎯 Final BM25 reranking using original query...")
+        all_chunks = self.hybrid_rag.faiss.rerank(queries[0], all_chunks, top_k=top_k * 2)
+        print(f"   ✓ Final result: {len(all_chunks)} top-ranked chunks")
         
         # Extract entities
         all_entities = self._extract_entities_from_chunks(all_chunks)
@@ -726,7 +719,7 @@ What would you like to know?"""
     
     async def delete_document(self, document_id: str, file_path: Optional[str] = None) -> None:
         """
-        Delete a document from the knowledge graph and optionally delete the physical file
+        Delete a document from the knowledge graph, FAISS index, and optionally delete the physical file
         
         Args:
             document_id: The ID of the document to delete
@@ -739,6 +732,16 @@ What would you like to know?"""
             print(f"✅ Deleted document {document_id} from knowledge graph")
         else:
             print(f"⚠️  Failed to delete document {document_id} from knowledge graph")
+        
+        # Delete from FAISS index (via hybrid_rag service)
+        try:
+            faiss_success = self.hybrid_rag.delete_document(document_id, file_path=file_path)
+            if faiss_success:
+                print(f"✅ Deleted document {document_id} from FAISS index")
+            else:
+                print(f"⚠️  Failed to delete document {document_id} from FAISS index")
+        except Exception as e:
+            print(f"❌ Error deleting document from FAISS: {e}")
         
         # Delete physical file if path provided
         if file_path:

@@ -73,13 +73,15 @@ class DocumentProcessor:
             raise ValueError(f"Unsupported file type: {file_path.suffix}")
     
     async def _process_pdf(self, file_path: Path, file_id: str, original_filename: str) -> Dict[str, Any]:
-        """Extract text from PDF with page number citations using PyMuPDF"""
+        """Extract text from PDF with page number citations using PyMuPDF, with OCR fallback for scanned/handwritten PDFs"""
         try:
             # Open PDF with PyMuPDF
             doc = fitz.open(str(file_path))
             text = ""
             page_mappings = []  # Track which character positions belong to which page
+            ocr_used = False
             
+            # First attempt: Extract text normally
             for page_num in range(len(doc)):
                 page = doc[page_num]
                 # Extract text with better accuracy using PyMuPDF
@@ -95,10 +97,49 @@ class DocumentProcessor:
             
             # Store page count before closing
             total_pages = len(doc)
+            
+            # Check if we got meaningful text (more than just whitespace/newlines)
+            meaningful_text = text.strip().replace('\n', '').replace(' ', '')
+            if len(meaningful_text) < 50 and total_pages > 1:  # Very little text for multi-page document
+                print(f"⚠️  PDF appears to be scanned/handwritten - attempting OCR extraction...")
+                ocr_used = True
+                text = ""
+                page_mappings = []
+                
+                # OCR each page
+                for page_num in range(len(doc)):
+                    page = doc[page_num]
+                    
+                    # Convert page to image
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom for better OCR
+                    img_data = pix.tobytes("png")
+                    
+                    # OCR the image
+                    try:
+                        from PIL import Image
+                        import io
+                        img = Image.open(io.BytesIO(img_data))
+                        page_text = pytesseract.image_to_string(img, config='--psm 6')  # Assume uniform block of text
+                        print(f"   📄 Page {page_num + 1} OCR: {len(page_text)} characters")
+                    except Exception as ocr_error:
+                        print(f"   ❌ OCR failed for page {page_num + 1}: {ocr_error}")
+                        page_text = ""
+                    
+                    start_pos = len(text)
+                    text += page_text + "\n\n"
+                    end_pos = len(text)
+                    page_mappings.append({
+                        "page": page_num + 1,
+                        "start": start_pos,
+                        "end": end_pos
+                    })
+            
             doc.close()
             
             # Chunk the text with page number tracking
             chunks = self._chunk_text_with_citations(text, page_mappings, "pdf")
+            
+            print(f"✅ PDF processed: {len(chunks)} chunks extracted {'(OCR)' if ocr_used else '(text)'}")
             
             return {
                 "id": file_id,
@@ -108,7 +149,8 @@ class DocumentProcessor:
                 "chunks": len(chunks),
                 "chunk_data": chunks,
                 "pages": total_pages,
-                "page_mappings": page_mappings
+                "page_mappings": page_mappings,
+                "ocr_used": ocr_used
             }
         except Exception as e:
             raise Exception(f"Error processing PDF: {str(e)}")
@@ -135,15 +177,36 @@ class DocumentProcessor:
             raise Exception(f"Error processing DOCX: {str(e)}")
     
     async def _process_image(self, file_path: Path, file_id: str, original_filename: str) -> Dict[str, Any]:
-        """Extract text from image using OCR"""
+        """
+        Extract text from image using OCR and generate visual embeddings with CLIP
+        Hybrid approach: Tesseract for text + CLIP for visual understanding
+        """
         try:
             image = Image.open(file_path)
             
-            # Perform OCR
+            # 1. Extract text with Tesseract OCR
             text = pytesseract.image_to_string(image)
             
-            # Chunk the text
+            # 2. Generate visual embedding with CLIP
+            clip_embedding = None
+            try:
+                from app.services.clip_service import get_clip_service
+                clip_service = get_clip_service()
+                clip_embedding = clip_service.encode_image(image)
+                if clip_embedding is not None:
+                    print(f"✅ Generated CLIP embedding for {original_filename}")
+                else:
+                    print(f"⚠️  CLIP embedding returned None for {original_filename}")
+            except Exception as clip_error:
+                print(f"⚠️  CLIP embedding failed (using Tesseract only): {clip_error}")
+            
+            # 3. Chunk the text
             chunks = self._chunk_text(text) if text.strip() else []
+            
+            # 4. Add CLIP embedding to chunks if available
+            if clip_embedding is not None:
+                for chunk in chunks:
+                    chunk["clip_embedding"] = clip_embedding.tolist()  # Convert numpy to list
             
             return {
                 "id": file_id,
@@ -152,7 +215,9 @@ class DocumentProcessor:
                 "text": text,
                 "chunks": len(chunks),
                 "chunk_data": chunks,
-                "dimensions": image.size
+                "dimensions": image.size,
+                "has_visual_embedding": clip_embedding is not None,
+                "clip_embedding": clip_embedding.tolist() if clip_embedding is not None else None
             }
         except Exception as e:
             raise Exception(f"Error processing image: {str(e)}")

@@ -26,6 +26,9 @@ torchaudio
 # Image embeddings
 transformers
 sentence-transformers
+open-clip-torch  # CLIP for visual embeddings
+ftfy  # Required by CLIP
+regex  # Required by CLIP
 
 # Vector search and reranking
 faiss-cpu

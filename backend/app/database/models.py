@@ -111,6 +111,7 @@ class DocumentChunk(Base):
     chunk_id = Column(String(100), nullable=False)
     text = Column(Text, nullable=False)
     chunk_metadata = Column(JSON)  # Renamed from 'metadata' to avoid SQLAlchemy conflict
+    clip_embedding = Column(JSON)  # CLIP visual embedding for images (stored as JSON array)
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships

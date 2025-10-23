@@ -127,7 +127,10 @@ export default function AIDashboard() {
   const fetchDocuments = async () => {
     try {
       const token = typeof window !== 'undefined' ? localStorage.getItem('auth_token') : null;
-      if (!token) return;
+      if (!token) {
+        console.log('No auth token found, skipping document fetch');
+        return;
+      }
       
       const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/documents`, {
         headers: {
@@ -137,6 +140,7 @@ export default function AIDashboard() {
       
       // Handle authentication errors
       if (response.status === 401) {
+        console.log('Auth token expired, redirecting to login');
         localStorage.removeItem('auth_token')
         window.location.href = '/login'
         return
@@ -157,10 +161,20 @@ export default function AIDashboard() {
             selected: false  // Existing files start unselected
           }));
           setUploadedFiles(existingFiles);
+          console.log(`Loaded ${existingFiles.length} existing documents`);
+        } else {
+          // No documents or empty response
+          setUploadedFiles([]);
+          console.log('No documents found');
         }
+      } else {
+        console.error(`Failed to fetch documents: ${response.status} ${response.statusText}`);
+        // Don't clear files on error, keep existing state
       }
     } catch (error) {
       console.error('Error fetching documents:', error);
+      // Network error or server down - keep existing state
+      // Don't show error to user as this runs on mount
     }
   }
 
@@ -271,10 +285,30 @@ export default function AIDashboard() {
       }
 
       if (response.ok) {
-        // Update files with processed status
-        newFiles.forEach(file => {
-          simulateUpload(file.id)
-        })
+        // Replace temporary IDs with real document IDs from backend
+        if (data.files && Array.isArray(data.files)) {
+          data.files.forEach((uploadedFile: any, index: number) => {
+            if (uploadedFile.status === 'processed' && uploadedFile.id && newFiles[index]) {
+              const tempId = newFiles[index].id;
+              const realId = uploadedFile.id.toString();
+              
+              // Update the file ID in state
+              setUploadedFiles(prev => 
+                prev.map(file => 
+                  file.id === tempId 
+                    ? { ...file, id: realId, uploadProgress: 100 } 
+                    : file
+                )
+              );
+              
+              console.log(`✅ Updated file ${newFiles[index].name}: temp ID ${tempId} -> real ID ${realId}`);
+            }
+          });
+        }
+        
+        // Refresh the documents list to ensure sync with backend
+        await fetchDocuments();
+        
       } else {
         throw new Error(data.detail || data.error || 'Upload failed')
       }
@@ -326,8 +360,16 @@ export default function AIDashboard() {
         return;
       }
       
+      // Parse fileId to integer (backend expects integer document_id)
+      const documentId = parseInt(fileId, 10);
+      if (isNaN(documentId)) {
+        console.error('Invalid document ID:', fileId);
+        alert('Invalid document ID');
+        return;
+      }
+      
       // Call delete API
-      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/documents/${fileId}`, {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/documents/${documentId}`, {
         method: 'DELETE',
         headers: {
           'Authorization': `Bearer ${token}`,

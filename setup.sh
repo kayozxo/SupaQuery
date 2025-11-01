@@ -35,17 +35,18 @@ ask_yes_no() {
 }
 
 # Function to ask for installation method
+# Returns choice via stdout: "docker" or "manual"
 ask_installation_method() {
     while true; do
-        echo -e "${BLUE}Which installation method would you like to use?${NC}"
-        echo "1) Docker (Easiest - Recommended)"
-        echo "2) Manual installation"
+        echo -e "${BLUE}Which installation method would you like to use?${NC}" >&2
+        echo "1) Docker (Easiest - Recommended)" >&2
+        echo "2) Manual installation" >&2
         read -p "$(echo -e ${BLUE}Enter choice [1/2]: ${NC})" choice
 
         case "$choice" in
-            1|docker|Docker|DOCKER) return 1;;
-            2|manual|Manual|MANUAL) return 2;;
-            * ) echo -e "${YELLOW}Please enter 1 for Docker or 2 for Manual.${NC}";;
+            1|docker|Docker|DOCKER) echo "docker"; return 0;;
+            2|manual|Manual|MANUAL) echo "manual"; return 0;;
+            * ) echo -e "${YELLOW}Please enter 1 for Docker or 2 for Manual.${NC}" >&2;;
         esac
     done
 }
@@ -105,15 +106,56 @@ install_python_deps() {
     fi
 
     # Activate virtual environment if it exists
+    VENV_ACTIVATED=false
+    VENV_PIP=""
+
     if [ -d "venv" ]; then
         echo -e "${BLUE}Activating virtual environment...${NC}"
-        source venv/bin/activate 2>/dev/null || source venv/Scripts/activate 2>/dev/null || true
+        if [ -f "venv/bin/activate" ]; then
+            source ./venv/bin/activate
+            VENV_ACTIVATED=true
+            VENV_PIP="pip"
+        elif [ -f "venv/Scripts/activate" ]; then
+            source ./venv/Scripts/activate
+            VENV_ACTIVATED=true
+            VENV_PIP="pip"
+        elif [ -f "venv/Scripts/pip.exe" ]; then
+            echo -e "${YELLOW}⚠️  Using venv pip directly (PowerShell/CMD venv detected)${NC}"
+            VENV_PIP="./venv/Scripts/pip.exe"
+        elif [ -f "venv/Scripts/Activate.ps1" ] || [ -f "venv/Scripts/activate.bat" ]; then
+            echo -e "${YELLOW}⚠️  Detected Windows venv, but this script is running in bash.${NC}"
+            echo -e "${YELLOW}   Trying to use venv pip directly...${NC}"
+            if [ -f "venv/Scripts/pip.exe" ]; then
+                VENV_PIP="./venv/Scripts/pip.exe"
+            else
+                echo -e "${RED}❌ Cannot activate venv or find pip executable${NC}"
+                echo -e "${YELLOW}   Please activate manually:${NC}"
+                if [ -f "venv/Scripts/Activate.ps1" ]; then
+                    echo -e "${BLUE}   PowerShell: .\venv\Scripts\Activate.ps1${NC}"
+                fi
+                if [ -f "venv/Scripts/activate.bat" ]; then
+                    echo -e "${BLUE}   CMD: .\venv\Scripts\activate.bat${NC}"
+                fi
+                echo -e "${YELLOW}   Then run: pip install -r requirements.txt${NC}"
+                cd ..
+                return 1
+            fi
+        else
+            echo -e "${YELLOW}⚠️  Could not find venv activation script${NC}"
+        fi
     fi
 
     # Install requirements
     if [ -f "requirements.txt" ]; then
-        pip install -r requirements.txt
-        echo -e "${GREEN}✅ Python dependencies installed${NC}"
+        if [ "$VENV_ACTIVATED" = true ] || [ -n "$VENV_PIP" ]; then
+            # Use venv pip if available, otherwise system pip
+            ${VENV_PIP:-pip} install -r requirements.txt
+            echo -e "${GREEN}✅ Python dependencies installed${NC}"
+        else
+            echo -e "${YELLOW}⚠️  Installing to system Python (venv not activated)${NC}"
+            pip install -r requirements.txt
+            echo -e "${GREEN}✅ Python dependencies installed${NC}"
+        fi
     else
         echo -e "${YELLOW}⚠️  requirements.txt not found${NC}"
     fi
@@ -277,12 +319,11 @@ if [ "$NEED_TO_KILL_OLLAMA" = true ] && [ -n "$OLLAMA_PID" ]; then
     echo -e "${GREEN}✅ Ollama service stopped${NC}"
 fi
 
-# ask about installation method and execute
+# Ask about installation method and execute
 echo ""
-ask_installation_method
-INSTALL_METHOD=$?
+INSTALL_METHOD=$(ask_installation_method)
 
-if [ $INSTALL_METHOD -eq 1 ]; then
+if [ "$INSTALL_METHOD" = "docker" ]; then
     setup_docker
 else
     setup_manual
